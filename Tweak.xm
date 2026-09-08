@@ -125,18 +125,23 @@ static void rg_repl(id self, SEL _cmd, float v, NSString *cat) {
     if (gRawMode) { if (orig) orig(self, _cmd, v, cat); return; }   // normalize 旁路
     if (!orig)    { return; }
     if (gInSet)   { orig(self, _cmd, v, cat); return; }            // 重入守卫
-    if (![rg_isTarget:cat]) { orig(self, _cmd, v, cat); return; }
+    if (!rg_isTarget(cat)) { orig(self, _cmd, v, cat); return; }
 
     gInSet = YES;
     rg_setPref(rg_trueKey(cat), @(v));          // 记住未压缩的真实值
     float store = v * (float)gFactor;
     // 顺带读系统 RingtoneVolume, 确认我的写入有没有进系统存储
-    float sysRinger = -1; Boolean valid = NO;
-    sysRinger = CFPreferencesGetAppValue((CFStringRef)@"RingtoneVolume",
+    float sysRinger = -1;
+    CFPropertyListRef rp = CFPreferencesCopyValue((CFStringRef)@"RingtoneVolume",
                  (CFStringRef)@"com.apple.preferences.sounds",
-                 kCFPreferencesCurrentUser, kCFPreferencesAnyHost, &valid);
-    if (gDiag) rg_log(@"SET %@ cat=%@ raw=%.4f store=%.4f k=%.3f sysRinger=%.4f(valid=%d)",
-                     selName, cat, v, store, gFactor, sysRinger, valid);
+                 kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (rp) {
+        if (CFGetTypeID(rp) == CFNumberGetTypeID())
+            CFNumberGetValue((CFNumberRef)rp, kCFNumberFloatType, &sysRinger);
+        CFRelease(rp);
+    }
+    if (gDiag) rg_log(@"SET %@ cat=%@ raw=%.4f store=%.4f k=%.3f sysRinger=%.4f",
+                     selName, cat, v, store, gFactor, sysRinger);
     orig(self, _cmd, store, cat);
     gInSet = NO;
 }
@@ -164,12 +169,20 @@ static void rg_hookAVSC(void) {
         IMP orig = NULL;
         MSHookMessageEx(c, sel, (IMP)rg_repl, &orig);
         if (orig) {
-            CFDictionarySetValue(gOrigMap, (__bridge CFStringRef)name, orig);
+            CFDictionarySetValue(gOrigMap, (__bridge CFStringRef)name, (const void*)orig);
             if (!gFirstSetterSel) gFirstSetterSel = sel;
             rg_log(@"AVSC-hooked %@", name);
         }
     }
     free(ml);
+}
+
+// ---------- 调原 setter (arm64 下必须用 typed 函数指针, 不能直接 objc_msgSend 传 float) ----------
+static void rg_callOrigSetter(id avsc, SEL sel, float val, NSString *cat) {
+    NSString *nm = NSStringFromSelector(sel);
+    void (*fn)(id,SEL,float,NSString*) =
+        (void(*)(id,SEL,float,NSString*))CFDictionaryGetValue(gOrigMap, (__bridge CFStringRef)nm);
+    if (fn) fn(avsc, sel, val, cat);
 }
 
 // ---------- 归一化: 改系数/respring 后, 用已记真实值立即重压所有目标类别 ----------
@@ -187,12 +200,12 @@ static void rg_normalize(void) {
         if (gEnabled) {
             if (m) {
                 float T = [m floatValue];
-                ((void(*)(id,SEL,float,NSString*))objc_msgSend)(avsc, gFirstSetterSel, T*(float)gFactor, cat);
+                rg_callOrigSetter(avsc, gFirstSetterSel, T*(float)gFactor, cat);
                 rg_log(@"normalize reapply %@ true=%.4f store=%.4f k=%.3f", cat, T, T*(float)gFactor, gFactor);
             }
         } else {
             if (m) {
-                ((void(*)(id,SEL,float,NSString*))objc_msgSend)(avsc, gFirstSetterSel, [m floatValue], cat);
+                rg_callOrigSetter(avsc, gFirstSetterSel, [m floatValue], cat);
                 rg_setPref(rg_trueKey(cat), nil);
             }
         }
@@ -209,8 +222,7 @@ static void rg_notifCallback(CFNotificationCenterRef center, void *observer,
 
 // ---------- ctor ----------
 %ctor {
-    gOrigMap = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
-                 &(CFDictionaryValueCallBacks){0,NULL,NULL,NULL,NULL,NULL});
+    gOrigMap = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, NULL);
     rg_refresh();
 
     // prefs 路径自检 (排查 roothide 跨进程读)
