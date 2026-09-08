@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>entry</key>
+	<dict>
+		<key>cell</key><string>PSLinkCell</string>
+		<key>label</key><string>RingerGainEQ</string>
+	</dict>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>label</key><string>铃声增益压制</string>
+			<key>footerText</key><string>通知/铃声/系统/闹钟走的是比媒体更"热"的音量曲线, 同 slider 位置比音乐响。本插件按系数压低铃声类的存储音量, 播放时自然与媒体拉平。系数越小压得越狠, 建议从 0.6 起按耳朵微调 (0.3~0.9)。</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSwitchCell</string>
+			<key>label</key><string>启用</string>
+			<key>key</key><string>enabled</string>
+			<key>default</key><true/>
+			<key>defaults</key><string>com.huhansibuxin.ringergaineq</string>
+			<key>PostNotification</key><string>com.huhansibuxin.ringergaineq-updated</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSEditTextCell</string>
+			<key>label</key><string>压低系数 (k)</string>
+			<key>key</key><string>suppressFactor</string>
+			<key>placeholder</key><string>0.6</string>
+			<key>default</key><string>0.6</string>
+			<key>defaults</key><string>com.huhansibuxin.ringergaineq</string>
+			<key>PostNotification</key><string>com.huhansibuxin.ringergaineq-updated</string>
+			<key>keyboard</key><string>DecimalPad</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSSwitchCell</string>
+			<key>label</key><string>诊断日志</string>
+			<key>key</key><string>diagnostic</string>
+			<key>default</key><true/>
+			<key>defaults</key><string>com.huhansibuxin.ringergaineq</string>
+			<key>PostNotification</key><string>com.huhansibuxin.ringergaineq-updated</string>
+		</dict>
+		<dict>
+			<key>cell</key><string>PSGroupCell</string>
+			<key>footerText</key><string>日志写入 /var/mobile/Documents/RingerGainEQ.log。装好触发一次通知即可看到真实 category 字符串与压低前后数值, 用来校准系数。</string>
+		</dict>
+	</array>
+	<key>title</key><string>RingerGainEQ</string>
+</dict>
+</plist>

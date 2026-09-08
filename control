@@ -1,0 +1,9 @@
+Package: com.huhansibuxin.ringergaineq
+Name: RingerGainEQ
+Depends: ellekit
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Suppress the hotter ringer/alert volume curve so notification and alert sounds match media loudness
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks
