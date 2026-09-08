@@ -135,7 +135,7 @@ static void rg_setVolumeTo(id self, SEL _cmd, float v, NSString *cat) {
     if (gRawMode || !gEnabled || !rg_isTarget(cat)) { gOrigSet(self, _cmd, v, cat); return; }
     if (gInSet) { gOrigSet(self, _cmd, v, cat); return; }
     gInSet = YES;
-    [rg_setPref(rg_trueKey(cat), @(v))];
+    rg_setPref(rg_trueKey(cat), @(v));
     float store = v * (float)gFactor;
     rg_log(@"SET  cat=%-8s raw=%.4f store=%.4f k=%.3f", [cat UTF8String], v, store, gFactor);
     gOrigSet(self, _cmd, store, cat);
@@ -145,7 +145,7 @@ static BOOL rg_setVolumeLevel(id self, SEL _cmd, float v, NSString *cat) {
     if (gRawMode || !gEnabled || !rg_isTarget(cat)) { return gOrigSetLvl(self, _cmd, v, cat); }
     if (gInSet) { return gOrigSetLvl(self, _cmd, v, cat); }
     gInSet = YES;
-    [rg_setPref(rg_trueKey(cat), @(v))];
+    rg_setPref(rg_trueKey(cat), @(v));
     float store = v * (float)gFactor;
     rg_log(@"SETL cat=%-8s raw=%.4f store=%.4f k=%.3f", [cat UTF8String], v, store, gFactor);
     BOOL r = gOrigSetLvl(self, _cmd, store, cat);
@@ -171,7 +171,7 @@ static void rg_normalize(void) {
         if (gEnabled) {
             id m = rg_pref(rg_trueKey(cat));
             float T = ([m isKindOfClass:[NSNumber class]]) ? [m floatValue] : S;
-            [rg_setPref(rg_trueKey(cat), @(T))];          // 记住真实值, 供后续恢复/防双重缩放
+            rg_setPref(rg_trueKey(cat), @(T));          // 记住真实值, 供后续恢复/防双重缩放
             rg_callSet(avsc, T * (float)gFactor, cat);    // 写回压低后的值
         } else {
             id m = rg_pref(rg_trueKey(cat));
@@ -184,6 +184,16 @@ static void rg_normalize(void) {
     }
     gRawMode = NO;
     rg_log(@"normalize done enabled=%d factor=%.3f", gEnabled, gFactor);
+}
+
+// ---------- 设置变更 Darwin 通知回调 (必须是 C 函数指针, 非 block) ----------
+static void rg_notifCallback(CFNotificationCenterRef center, void *observer,
+                             CFStringRef name, const void *obj, CFDictionaryRef info) {
+    rg_refresh();
+    // Darwin 回调不在主线程, normalize 调 AVSystemController 需回主队列
+    dispatch_async(dispatch_get_main_queue(), ^{
+        rg_normalize();
+    });
 }
 
 // ---------- ctor ----------
@@ -203,13 +213,10 @@ static void rg_normalize(void) {
     rg_log(@"ctor enabled=%d factor=%.3f diag=%d VF=%d GET=%d SET=%d SETL=%d",
            gEnabled, gFactor, gDiag, gOrigVF!=NULL, gOrigGetLvl!=NULL, gOrigSet!=NULL, gOrigSetLvl!=NULL);
 
-    // 设置变更通知 (Darwin notify, 跨进程, 必须主线程刷新 UI 相关逻辑)
+    // 设置变更通知 (Darwin notify, 跨进程)
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        ^(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *obj, CFDictionaryRef info) {
-            rg_refresh();
-            rg_normalize();
-        },
+        rg_notifCallback,
         (CFStringRef)kChanged, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
     // 延迟 2s, 确保 AVSystemController 已初始化
