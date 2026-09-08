@@ -1,16 +1,26 @@
 #import <Foundation/Foundation.h>
 #import <substrate.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 
 // ============================================================
-//  RingerGainEQ
+//  RingerGainEQ v2.0.0
 //  压制"比音乐热"的铃声/通知音量曲线。
-//  原理：铃声类通道(Ringtone/Alert/System/Alarm)的音量曲线在音频 HAL 里
-//  比 Media 曲线整体更"热"(同一 slider 位置 dB 更高)。rootless 改不了系统
-//  框架二进制, 所以在曲线入口 AVSystemController 拦截音量写入, 把铃声类的
-//  存储值乘系数 k 压低, 播放时曲线吐出的 dB 跟着降, 自然和媒体拉平。
-//  setter 压低存盘 + getter 回算, UI 仍显示你设的真实数字。
-//  不 hook mediaserverd/audiomxd, 避免全机没声风险。
+//  v1 失败复盘: 压了 setVolumeTo:forCategory: 的值但播放无变化。
+//  两个嫌疑(v1 都是猜的):
+//   (A) roothide 下 CFPreferences/NSUserDefaults suiteName 读不到 jbroot 写的设置
+//       -> gFactor 停在默认 0.6, 用户改 0.1 等于没改
+//   (B) setVolumeTo:forCategory: 根本不是系统写/读铃声音量的真路径
+//       (Settings 改音量可能直接写 plist, 不进 AVSystemController)
+//  v2 改法:
+//   * 设置读取改走 jbroot 文件直读(dladdr 自定位 jbroot + initWithContentsOfFile)
+//     掐死嫌疑(A); 写入也直写文件, 跨进程必可见
+//   * %ctor 运行时枚举 AVSystemController 全部 *olume* 方法, 对每个
+//     (void)setXxx:(float)forCategory:(NSString*) 签名的 setter 都 hook 压低
+//     -> 谁才是真路径, 日志里一目了然, 不再猜 selector
+//   * 每次 SET 顺带打印系统 RingtoneVolume(CFPreferences com.apple.preferences.sounds),
+//     确认我的写入有没有进系统存储(掐死嫌疑 B)
+//  日志写 /var/mobile/Documents/RingerGainEQ.log (SB 沙盒内视角, 固定)
 // ============================================================
 
 // ---------- config ----------
@@ -23,27 +33,51 @@ static BOOL   gEnabled = YES;
 static double gFactor  = 0.6;   // 压低系数: 铃声存储值 = 真实值 * k
 static BOOL   gDiag    = YES;
 static BOOL   gRawMode = NO;    // normalize 期间旁路缩放
-static BOOL   gInSet   = NO;    // 防止 setVolumeTo 内部再调 setVolumeLevel 导致双重缩放
-static BOOL   gInGet   = NO;
+static BOOL   gInSet   = NO;    // 防 setVolumeTo 内部再调其它 setter 导致双重缩放
+static CFMutableDictionaryRef gOrigMap = NULL;  // selName(NSString) -> 原 IMP(void*)
+static SEL    gFirstSetterSel = NULL;            // normalize 用的首个已 hook setter
 
-// original IMPs (AVSystemController 在 Celestial 私有框架, 运行时解析)
-static float  (*gOrigVF)    (id, SEL, id)            = NULL; // volumeForCategory:
-static BOOL   (*gOrigGetLvl)(id, SEL, float *, id)   = NULL; // getVolumeLevel:forCategory:
-static void   (*gOrigSet)   (id, SEL, float, id)     = NULL; // setVolumeTo:forCategory:
-static BOOL   (*gOrigSetLvl)(id, SEL, float, id)     = NULL; // setVolumeLevel:forCategory:
+// ---------- jbroot 定位 (roothide 跨进程读设置铁律) ----------
+static NSString *rg_jbroot(void) {
+    Dl_info info;
+    if (dladdr((const void*)&rg_jbroot, &info) && info.dli_fname) {
+        NSString *path = [NSString stringWithUTF8String:info.dli_fname];
+        // dylib 路径形如 <jbroot>/usr/lib/TweakInject/RingerGainEQ.dylib
+        NSRange r = [path rangeOfString:@"/usr/lib/TweakInject/"];
+        if (r.location != NSNotFound) return [path substringToIndex:r.location];
+    }
+    return @"";
+}
+static NSString *rg_prefsPath(void) {
+    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/%@.plist", rg_jbroot(), kDomain];
+}
 
-// ---------- prefs ----------
+// ---------- prefs (jbroot 文件直读 + CFPreferences 兜底) ----------
 static id rg_pref(NSString *key) {
+    NSString *path = rg_prefsPath();
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+    id v = d ? d[key] : nil;
+    if (v) return v;
     return CFBridgingRelease(CFPreferencesCopyAppValue((CFStringRef)key, (CFStringRef)kDomain));
 }
 static void rg_setPref(NSString *key, id value) {
+    // 主: 直写 jbroot plist 文件 (跨进程必可见)
+    NSString *path = rg_prefsPath();
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:path];
+    if (!d) d = [NSMutableDictionary dictionary];
+    if (value) d[key] = value; else [d removeObjectForKey:key];
+    [d writeToFile:path atomically:YES];
+    // 兜底: CFPreferences
     CFPreferencesSetAppValue((CFStringRef)key, (__bridge CFPropertyListRef)value, (CFStringRef)kDomain);
     CFPreferencesAppSynchronize((CFStringRef)kDomain);
 }
 static BOOL rg_bool(NSString *key, BOOL def) {
     Boolean valid = false;
     Boolean v = CFPreferencesGetAppBooleanValue((CFStringRef)key, (CFStringRef)kDomain, &valid);
-    return valid ? (BOOL)v : def;
+    if (valid) return (BOOL)v;
+    id m = rg_pref(key);
+    if ([m isKindOfClass:[NSNumber class]]) return [m boolValue];
+    return def;
 }
 static double rg_double(NSString *key, double def) {
     id v = rg_pref(key);
@@ -51,11 +85,8 @@ static double rg_double(NSString *key, double def) {
     if ([v isKindOfClass:[NSString class]]) {
         NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if ([s length] == 0) return def;
-        NSScanner *sc = [NSScanner scannerWithString:s];
-        double d = 0;
-        if ([sc scanDouble:&d] && [sc isAtEnd]) return d;
-        return def;
+        if ([s length]) { NSScanner *sc = [NSScanner scannerWithString:s]; double dd = 0;
+                          if ([sc scanDouble:&dd] && [sc isAtEnd]) return dd; }
     }
     return def;
 }
@@ -63,165 +94,147 @@ static void rg_refresh(void) {
     gEnabled = rg_bool(@"enabled", YES);
     gDiag    = rg_bool(@"diagnostic", YES);
     gFactor  = rg_double(@"suppressFactor", 0.6);
-    if (gFactor < 0.1 || gFactor > 1.0) gFactor = 0.6;
+    if (gFactor < 0.05 || gFactor > 1.0) gFactor = 0.6;
 }
 static BOOL rg_isTarget(NSString *cat) {
     if (!cat) return NO;
     return [cat isEqualToString:@"Ringtone"] || [cat isEqualToString:@"Alert"] ||
-           [cat isEqualToString:@"System"]   || [cat isEqualToString:@"Alarm"];
+           [cat isEqualToString:@"System"]   || [cat isEqualToString:@"Alarm"] ||
+           [cat isEqualToString:@"PhoneCall"] || [cat isEqualToString:@"RingtoneVibration"];
 }
 static NSString *rg_trueKey(NSString *cat) {
     return [NSString stringWithFormat:@"true_%@", cat];
 }
 
-// ---------- logging (写文件, 不用 oslog, 沙盒外固定路径) ----------
+// ---------- logging ----------
 static void rg_log(NSString *fmt, ...) {
     if (!gDiag) return;
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"%@ [RingerGainEQ] %@\n", [NSDate date], msg];
+    NSString *line = [NSString stringWithFormat:@"%@ [RGEQ] %@\n", [NSDate date], msg];
     FILE *f = fopen(kLogFile, "a");
     if (f) { fputs([line UTF8String], f); fflush(f); fclose(f); }
 }
 
-// ---------- 统一调用入口 (走 hook 后的方法, 自动遵守 gRawMode) ----------
-static float rg_callGet(id avsc, NSString *cat) {
-    if (gOrigVF) {
-        typedef float (*ft)(id, SEL, id);
-        static SEL s = NULL; if (!s) s = @selector(volumeForCategory:);
-        return ((ft)objc_msgSend)(avsc, s, cat);
-    } else if (gOrigGetLvl) {
-        typedef BOOL (*ft)(id, SEL, float *, id);
-        static SEL s = NULL; if (!s) s = @selector(getVolumeLevel:forCategory:);
-        float lv = 0; ((ft)objc_msgSend)(avsc, s, &lv, cat); return lv;
-    }
-    return 0;
-}
-static void rg_callSet(id avsc, float v, NSString *cat) {
-    if (gOrigSet) {
-        typedef void (*ft)(id, SEL, float, id);
-        static SEL s = NULL; if (!s) s = @selector(setVolumeTo:forCategory:);
-        ((ft)objc_msgSend)(avsc, s, v, cat);
-    } else if (gOrigSetLvl) {
-        typedef BOOL (*ft)(id, SEL, float, id);
-        static SEL s = NULL; if (!s) s = @selector(setVolumeLevel:forCategory:);
-        ((ft)objc_msgSend)(avsc, s, v, cat);
-    }
-}
+// ---------- 通用 setter 替换: 压低目标类别 ----------
+static void rg_repl(id self, SEL _cmd, float v, NSString *cat) {
+    NSString *selName = NSStringFromSelector(_cmd);
+    void (*orig)(id, SEL, float, NSString*) =
+        (void(*)(id,SEL,float,NSString*))CFDictionaryGetValue(gOrigMap, (__bridge CFStringRef)selName);
+    if (gRawMode) { if (orig) orig(self, _cmd, v, cat); return; }   // normalize 旁路
+    if (!orig)    { return; }
+    if (gInSet)   { orig(self, _cmd, v, cat); return; }            // 重入守卫
+    if (![rg_isTarget:cat]) { orig(self, _cmd, v, cat); return; }
 
-// ---------- hooks ----------
-static float rg_volumeForCategory(id self, SEL _cmd, NSString *cat) {
-    float v = gOrigVF(self, _cmd, cat);
-    if (gRawMode || !gEnabled || !rg_isTarget(cat)) return v;
-    if (gInGet) return v;
-    gInGet = YES;
-    float out = v / (float)gFactor;
-    rg_log(@"GET  cat=%-8s raw=%.4f shown=%.4f k=%.3f", [cat UTF8String], v, out, gFactor);
-    gInGet = NO;
-    return out;
-}
-static BOOL rg_getVolumeLevel(id self, SEL _cmd, float *level, NSString *cat) {
-    BOOL r = gOrigGetLvl(self, _cmd, level, cat);
-    if (gRawMode || !gEnabled || !rg_isTarget(cat) || !level) return r;
-    if (gInGet) return r;
-    gInGet = YES;
-    *level = *level / (float)gFactor;
-    rg_log(@"GETL cat=%-8s raw=%.4f shown=%.4f k=%.3f", [cat UTF8String], *level, *level, gFactor);
-    gInGet = NO;
-    return r;
-}
-static void rg_setVolumeTo(id self, SEL _cmd, float v, NSString *cat) {
-    if (gRawMode || !gEnabled || !rg_isTarget(cat)) { gOrigSet(self, _cmd, v, cat); return; }
-    if (gInSet) { gOrigSet(self, _cmd, v, cat); return; }
     gInSet = YES;
-    rg_setPref(rg_trueKey(cat), @(v));
+    rg_setPref(rg_trueKey(cat), @(v));          // 记住未压缩的真实值
     float store = v * (float)gFactor;
-    rg_log(@"SET  cat=%-8s raw=%.4f store=%.4f k=%.3f", [cat UTF8String], v, store, gFactor);
-    gOrigSet(self, _cmd, store, cat);
+    // 顺带读系统 RingtoneVolume, 确认我的写入有没有进系统存储
+    float sysRinger = -1; Boolean valid = NO;
+    sysRinger = CFPreferencesGetAppValue((CFStringRef)@"RingtoneVolume",
+                 (CFStringRef)@"com.apple.preferences.sounds",
+                 kCFPreferencesCurrentUser, kCFPreferencesAnyHost, &valid);
+    if (gDiag) rg_log(@"SET %@ cat=%@ raw=%.4f store=%.4f k=%.3f sysRinger=%.4f(valid=%d)",
+                     selName, cat, v, store, gFactor, sysRinger, valid);
+    orig(self, _cmd, store, cat);
     gInSet = NO;
 }
-static BOOL rg_setVolumeLevel(id self, SEL _cmd, float v, NSString *cat) {
-    if (gRawMode || !gEnabled || !rg_isTarget(cat)) { return gOrigSetLvl(self, _cmd, v, cat); }
-    if (gInSet) { return gOrigSetLvl(self, _cmd, v, cat); }
-    gInSet = YES;
-    rg_setPref(rg_trueKey(cat), @(v));
-    float store = v * (float)gFactor;
-    rg_log(@"SETL cat=%-8s raw=%.4f store=%.4f k=%.3f", [cat UTF8String], v, store, gFactor);
-    BOOL r = gOrigSetLvl(self, _cmd, store, cat);
-    gInSet = NO;
-    return r;
-}
 
-// ---------- 归一化: 让效果立即生效, 无需手动重拖音量 (且避免每次 respring 双重缩放) ----------
-static void rg_normalize(void) {
-    if ((!gOrigVF && !gOrigGetLvl) || (!gOrigSet && !gOrigSetLvl)) {
-        rg_log(@"normalize skipped: no AVSystemController volume hooks");
-        return;
-    }
+// ---------- 枚举 AVSystemController 全部 volume setter 并 hook ----------
+static void rg_hookAVSC(void) {
     Class c = NSClassFromString(@"AVSystemController");
-    if (!c) { rg_log(@"normalize skipped: AVSystemController class missing"); return; }
+    if (!c) { rg_log(@"rg_hookAVSC: class not loaded yet, retry later"); return; }
+    unsigned int n = 0;
+    Method *ml = class_copyMethodList(c, &n);
+    for (unsigned i = 0; i < n; i++) {
+        SEL sel = method_getName(ml[i]);
+        NSString *name = NSStringFromSelector(sel);
+        if ([name rangeOfString:@"olume" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        rg_log(@"AVSC-method %@", name);
+        unsigned int argc = method_getNumberOfArguments(ml[i]);
+        if (argc != 4) continue;                       // 仅处理 2 参数实例方法
+        char t0[64], t1[64];
+        method_getArgumentType(ml[i], 2, t0, 64);
+        method_getArgumentType(ml[i], 3, t1, 64);
+        if (strcmp(t0, "f") != 0) continue;            // 第1参 float
+        if (strcmp(t1, "@") != 0) continue;            // 第2参 id(NSString*)
+        if (![name hasPrefix:@"set"]) continue;        // 仅 hook setter
+        if (CFDictionaryGetValue(gOrigMap, (__bridge CFStringRef)name)) continue; // 已 hook
+        IMP orig = NULL;
+        MSHookMessageEx(c, sel, (IMP)rg_repl, &orig);
+        if (orig) {
+            CFDictionarySetValue(gOrigMap, (__bridge CFStringRef)name, orig);
+            if (!gFirstSetterSel) gFirstSetterSel = sel;
+            rg_log(@"AVSC-hooked %@", name);
+        }
+    }
+    free(ml);
+}
+
+// ---------- 归一化: 改系数/respring 后, 用已记真实值立即重压所有目标类别 ----------
+static void rg_normalize(void) {
+    Class c = NSClassFromString(@"AVSystemController");
+    if (!c) { rg_log(@"normalize skipped: class missing"); return; }
     id avsc = [c performSelector:@selector(sharedAVSystemController)];
-    if (!avsc) { rg_log(@"normalize skipped: sharedAVSystemController nil"); return; }
+    if (!avsc) { rg_log(@"normalize skipped: shared nil"); return; }
+    if (!gFirstSetterSel) { rg_log(@"normalize skipped: no setter hooked"); return; }
 
     gRawMode = YES;
-    NSArray *cats = @[@"Ringtone", @"Alert", @"System", @"Alarm"];
+    NSArray *cats = @[@"Ringtone", @"Alert", @"System", @"Alarm", @"PhoneCall"];
     for (NSString *cat in cats) {
-        float S = rg_callGet(avsc, cat);   // 原始存储值 (gRawMode 旁路)
+        id m = rg_pref(rg_trueKey(cat));
         if (gEnabled) {
-            id m = rg_pref(rg_trueKey(cat));
-            float T = ([m isKindOfClass:[NSNumber class]]) ? [m floatValue] : S;
-            rg_setPref(rg_trueKey(cat), @(T));          // 记住真实值, 供后续恢复/防双重缩放
-            rg_callSet(avsc, T * (float)gFactor, cat);    // 写回压低后的值
-        } else {
-            id m = rg_pref(rg_trueKey(cat));
             if (m) {
-                rg_callSet(avsc, [m floatValue], cat);    // 恢复真实值
-                CFPreferencesSetAppValue((CFStringRef)rg_trueKey(cat), NULL, (CFStringRef)kDomain);
-                CFPreferencesAppSynchronize((CFStringRef)kDomain);
+                float T = [m floatValue];
+                ((void(*)(id,SEL,float,NSString*))objc_msgSend)(avsc, gFirstSetterSel, T*(float)gFactor, cat);
+                rg_log(@"normalize reapply %@ true=%.4f store=%.4f k=%.3f", cat, T, T*(float)gFactor, gFactor);
+            }
+        } else {
+            if (m) {
+                ((void(*)(id,SEL,float,NSString*))objc_msgSend)(avsc, gFirstSetterSel, [m floatValue], cat);
+                rg_setPref(rg_trueKey(cat), nil);
             }
         }
     }
     gRawMode = NO;
-    rg_log(@"normalize done enabled=%d factor=%.3f", gEnabled, gFactor);
 }
 
-// ---------- 设置变更 Darwin 通知回调 (必须是 C 函数指针, 非 block) ----------
+// ---------- 设置变更 Darwin 通知回调 (必须是 C 函数指针) ----------
 static void rg_notifCallback(CFNotificationCenterRef center, void *observer,
                              CFStringRef name, const void *obj, CFDictionaryRef info) {
     rg_refresh();
-    // Darwin 回调不在主线程, normalize 调 AVSystemController 需回主队列
-    dispatch_async(dispatch_get_main_queue(), ^{
-        rg_normalize();
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ rg_normalize(); });
 }
 
 // ---------- ctor ----------
 %ctor {
+    gOrigMap = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                 &(CFDictionaryValueCallBacks){0,NULL,NULL,NULL,NULL,NULL});
     rg_refresh();
-    Class c = NSClassFromString(@"AVSystemController");
-    if (c) {
-        SEL gs = @selector(volumeForCategory:);
-        SEL gl = @selector(getVolumeLevel:forCategory:);
-        SEL ss = @selector(setVolumeTo:forCategory:);
-        SEL sl = @selector(setVolumeLevel:forCategory:);
-        if ([c instancesRespondToSelector:gs]) MSHookMessageEx(c, gs, (IMP)rg_volumeForCategory, (IMP*)&gOrigVF);
-        if ([c instancesRespondToSelector:gl]) MSHookMessageEx(c, gl, (IMP)rg_getVolumeLevel,    (IMP*)&gOrigGetLvl);
-        if ([c instancesRespondToSelector:ss]) MSHookMessageEx(c, ss, (IMP)rg_setVolumeTo,        (IMP*)&gOrigSet);
-        if ([c instancesRespondToSelector:sl]) MSHookMessageEx(c, sl, (IMP)rg_setVolumeLevel,     (IMP*)&gOrigSetLvl);
+
+    // prefs 路径自检 (排查 roothide 跨进程读)
+    NSString *pp = rg_prefsPath();
+    rg_log(@"ctor jbroot=%@ prefsPath=%@ fileExists=%d enabled=%d factor=%.3f diag=%d",
+           rg_jbroot(), pp, [[NSFileManager defaultManager] fileExistsAtPath:pp],
+           gEnabled, gFactor, gDiag);
+
+    // 枚举 + hook (类可能尚未加载, 延迟重试)
+    rg_hookAVSC();
+    if (CFDictionaryGetCount(gOrigMap) == 0) {
+        for (int k = 1; k <= 3; k++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(k * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ rg_hookAVSC(); });
+        }
     }
-    rg_log(@"ctor enabled=%d factor=%.3f diag=%d VF=%d GET=%d SET=%d SETL=%d",
-           gEnabled, gFactor, gDiag, gOrigVF!=NULL, gOrigGetLvl!=NULL, gOrigSet!=NULL, gOrigSetLvl!=NULL);
 
     // 设置变更通知 (Darwin notify, 跨进程)
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        rg_notifCallback,
-        (CFStringRef)kChanged, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        rg_notifCallback, (CFStringRef)kChanged, NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // 延迟 2s, 确保 AVSystemController 已初始化
+    // 延迟 2s 归一化 (确保 AVSystemController 已初始化 + 类已加载)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        rg_normalize();
-    });
+                   dispatch_get_main_queue(), ^{ rg_normalize(); });
 }
